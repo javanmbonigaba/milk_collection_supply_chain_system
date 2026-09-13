@@ -7,10 +7,12 @@ export type Farmer = {
   nationalId?: string;
   phone: string;
   email?: string;
+  province?: string;
   district?: string;
   sector?: string;
   village?: string;
   cell?: string;
+  fullAddress?: string;
   mccId: string;
   mccName?: string;
   registeredBy?: string;
@@ -54,7 +56,7 @@ export type CowRegistrationAuthorization = {
   requestedByName: string;
   cowCount: number;
   cowTags: string[];
-  status: "PENDING_AUTHORIZATION" | "AUTHORIZED" | "REGISTERED" | "EXPIRED" | "REJECTED";
+  status: "PENDING_AUTHORIZATION" | "AUTHORIZED" | "REGISTERED" | "EXPIRED" | "REJECTED" | "CANCELLED";
   otpCode: string;
   createdAt: string;
   expiresAt: string;
@@ -65,7 +67,9 @@ export type CowRegistrationSession = CowRegistrationAuthorization & {
   farmerPhone: string;
   verifiedAt?: string;
   usedAt?: string;
+  cancelledAt?: string;
   failedAttempts: number;
+  resendCount: number;
 };
 
 export type MilkCollection = {

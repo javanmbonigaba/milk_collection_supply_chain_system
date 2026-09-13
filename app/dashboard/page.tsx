@@ -17,6 +17,31 @@ type DashboardData = {
   cowRegistrationAuthorizations: CowRegistrationAuthorization[];
 };
 
+const emptyDashboardData: DashboardData = {
+  farmers: [],
+  animals: [],
+  collections: [],
+  veterinaryRecords: [],
+  collectionRequests: [],
+  cowRegistrationAuthorizations: [],
+  milkPrice: 620,
+  mccSharePercent: 10,
+  collectorSharePercent: 5,
+};
+
+function normalizeDashboardData(payload: Partial<DashboardData>): DashboardData {
+  return {
+    ...emptyDashboardData,
+    ...payload,
+    farmers: Array.isArray(payload.farmers) ? payload.farmers : [],
+    animals: Array.isArray(payload.animals) ? payload.animals : [],
+    collections: Array.isArray(payload.collections) ? payload.collections : [],
+    veterinaryRecords: Array.isArray(payload.veterinaryRecords) ? payload.veterinaryRecords : [],
+    collectionRequests: Array.isArray(payload.collectionRequests) ? payload.collectionRequests : [],
+    cowRegistrationAuthorizations: Array.isArray(payload.cowRegistrationAuthorizations) ? payload.cowRegistrationAuthorizations : [],
+  };
+}
+
 type Slice = { label: string; value: number; color: string };
 
 function PieSummary({ title, slices }: { title: string; slices: Slice[] }) {
@@ -72,9 +97,13 @@ export default function DashboardPage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "phase2", userId: user.uid }),
     })
-      .then((response) => response.json() as Promise<DashboardData>)
+      .then(async (response) => {
+        const payload = await response.json() as Partial<DashboardData> & { error?: string };
+        if (!response.ok || payload.error) throw new Error(payload.error ?? "Dashboard data could not be loaded.");
+        return normalizeDashboardData(payload);
+      })
       .then((nextData) => { if (active) { setData(nextData); setMccSharePercent(String(nextData.mccSharePercent)); setCollectorSharePercent(String(nextData.collectorSharePercent)); } })
-      .catch(() => { if (active) setData({ farmers: [], animals: [], collections: [], veterinaryRecords: [], collectionRequests: [], cowRegistrationAuthorizations: [], milkPrice: 620, mccSharePercent: 10, collectorSharePercent: 5 }); });
+      .catch(() => { if (active) { setData(emptyDashboardData); setMccSharePercent(String(emptyDashboardData.mccSharePercent)); setCollectorSharePercent(String(emptyDashboardData.collectorSharePercent)); } });
     return () => { active = false; };
   }, [user?.uid]);
 

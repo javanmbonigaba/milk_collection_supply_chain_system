@@ -1,7 +1,10 @@
 import { NextResponse } from "next/server";
+import { buildFarmerAddress } from "@/lib/farmer-validation";
 import {
   appendAuditEntryToDatabase,
   createCowRegistrationBatch,
+  cancelCowRegistrationBatch,
+  resendCowRegistrationOtp,
   createBreedType,
   listBreedTypes,
   verifyCowRegistrationBatch,
@@ -63,6 +66,13 @@ import {
   decideCollectorBatches,
 } from "@/lib/data-layer";
 import { DEFAULT_INITIAL_PASSWORD } from "@/lib/app-data";
+import {
+  getCompleteCellOptions,
+  getCompleteDistrictOptions,
+  getCompleteProvinceOptions,
+  getCompleteSectorOptions,
+  getCompleteVillageOptions,
+} from "@/lib/rwanda-address-server";
 
 export async function GET() {
   const state = await readDatabaseState();
@@ -143,6 +153,42 @@ export async function POST(request: Request) {
       const actor = await getUserByUid(body.userId ?? "");
       if (!actor) return NextResponse.json({ error: "Authenticated user required." }, { status: 401 });
       return NextResponse.json(await getScopedPhase2Data(actor));
+    }
+
+    if (body.action === "rwandaAddressOptions") {
+      const province = String(body.data?.province ?? "");
+      const district = String(body.data?.district ?? "");
+      const sector = String(body.data?.sector ?? "");
+      const cell = String(body.data?.cell ?? "");
+      return NextResponse.json({
+        provinces: getCompleteProvinceOptions(),
+        districts: province ? getCompleteDistrictOptions(province) : [],
+        sectors: province && district ? getCompleteSectorOptions(province, district) : [],
+        cells: province && district && sector ? getCompleteCellOptions(province, district, sector) : [],
+        villages: province && district && sector && cell ? getCompleteVillageOptions(province, district, sector, cell) : [],
+      });
+    }
+
+    if (body.action === "farmerAddress") {
+      const actor = await getUserByUid(body.userId ?? "");
+      if (!actor) return NextResponse.json({ error: "Authenticated user required." }, { status: 401 });
+      const farmer = (await listFarmers()).find((entry) => entry.farmerId === String(body.data?.farmerId ?? ""));
+      if (!farmer) return NextResponse.json({ error: "Farmer was not found." }, { status: 404 });
+      return NextResponse.json({
+        province: farmer.province ?? null,
+        district: farmer.district ?? null,
+        sector: farmer.sector ?? null,
+        cell: farmer.cell ?? null,
+        village: farmer.village ?? null,
+        country: "Rwanda",
+        full_address: farmer.fullAddress ?? buildFarmerAddress({
+          province: farmer.province ?? "",
+          district: farmer.district ?? "",
+          sector: farmer.sector ?? "",
+          cell: farmer.cell ?? "",
+          village: farmer.village ?? "",
+        }),
+      });
     }
 
     if (body.action === "breedTypes") {
@@ -304,6 +350,16 @@ export async function POST(request: Request) {
         requestedBy: actor.uid,
         cows: Array.isArray(data.cows) ? data.cows : [],
       });
+      if (result.supersededBatchId) {
+        await appendAuditEntryToDatabase({
+          userId: actor.uid,
+          action: "COW_REGISTRATION_OTP_SUPERSEDED",
+          module: "animals",
+          entityType: "cowRegistrationBatch",
+          entityId: result.supersededBatchId,
+          description: `A new OTP request for this farmer replaced the still-pending batch ${result.supersededBatchId}; only one active OTP per farmer is allowed.`,
+        }, actor.uid);
+      }
       await appendAuditEntryToDatabase({
         userId: actor.uid,
         action: "COW_REGISTRATION_AUTHORIZATION_REQUESTED",
@@ -320,18 +376,67 @@ export async function POST(request: Request) {
       if (!actor || !["SUPER_ADMIN", "ADMIN", "MCC_MANAGER", "MCC_OFFICER", "MILK_COLLECTOR", "VETERINARY_OFFICER"].includes(actor.role)) {
         return NextResponse.json({ error: "You are not allowed to verify cow registration batches." }, { status: 403 });
       }
-      const result = await verifyCowRegistrationBatch({
-        batchId: String(body.data?.batchId ?? ""),
-        otp: String(body.data?.otp ?? ""),
-        requestedBy: actor.uid,
-      });
+      const batchId = String(body.data?.batchId ?? "");
+      try {
+        const result = await verifyCowRegistrationBatch({
+          batchId,
+          otp: String(body.data?.otp ?? ""),
+          requestedBy: actor.uid,
+        });
+        await appendAuditEntryToDatabase({
+          userId: actor.uid,
+          action: "COW_REGISTRATION_BATCH_REGISTERED",
+          module: "animals",
+          entityType: "cowRegistrationBatch",
+          entityId: result.batchId,
+          description: `${result.registeredCount} cows were registered after successful farmer OTP authorization.`,
+        }, actor.uid);
+        return NextResponse.json({ ok: true, ...result });
+      } catch (error) {
+        await appendAuditEntryToDatabase({
+          userId: actor.uid,
+          action: "COW_REGISTRATION_OTP_VERIFICATION_FAILED",
+          module: "animals",
+          entityType: "cowRegistrationBatch",
+          entityId: batchId,
+          description: error instanceof Error ? error.message.replace(/\n/g, " ") : "OTP verification failed.",
+        }, actor.uid);
+        throw error;
+      }
+    }
+
+    if (body.action === "cancelCowRegistrationBatch") {
+      const actor = await getUserByUid(body.userId ?? "");
+      if (!actor || !["SUPER_ADMIN", "ADMIN", "MCC_MANAGER", "MCC_OFFICER", "MILK_COLLECTOR", "VETERINARY_OFFICER"].includes(actor.role)) {
+        return NextResponse.json({ error: "You are not allowed to cancel cow registration batches." }, { status: 403 });
+      }
+      const batchId = String(body.data?.batchId ?? "");
+      const result = await cancelCowRegistrationBatch({ batchId, requestedBy: actor.uid });
       await appendAuditEntryToDatabase({
         userId: actor.uid,
-        action: "COW_REGISTRATION_BATCH_REGISTERED",
+        action: "COW_REGISTRATION_OTP_CANCELLED",
         module: "animals",
         entityType: "cowRegistrationBatch",
         entityId: result.batchId,
-        description: `${result.registeredCount} cows were registered after successful farmer OTP authorization.`,
+        description: "The collector cancelled OTP verification before the cow registration was completed. No cow was created.",
+      }, actor.uid);
+      return NextResponse.json({ ok: true, ...result });
+    }
+
+    if (body.action === "resendCowRegistrationOtp") {
+      const actor = await getUserByUid(body.userId ?? "");
+      if (!actor || !["SUPER_ADMIN", "ADMIN", "MCC_MANAGER", "MCC_OFFICER", "MILK_COLLECTOR", "VETERINARY_OFFICER"].includes(actor.role)) {
+        return NextResponse.json({ error: "You are not allowed to resend a cow registration OTP." }, { status: 403 });
+      }
+      const batchId = String(body.data?.batchId ?? "");
+      const result = await resendCowRegistrationOtp({ batchId, requestedBy: actor.uid });
+      await appendAuditEntryToDatabase({
+        userId: actor.uid,
+        action: "COW_REGISTRATION_OTP_RESENT",
+        module: "animals",
+        entityType: "cowRegistrationBatch",
+        entityId: result.batchId,
+        description: "A new OTP was generated for the farmer; the previous OTP is no longer valid.",
       }, actor.uid);
       return NextResponse.json({ ok: true, ...result });
     }
@@ -577,6 +682,8 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unsupported action" }, { status: 400 });
   } catch (error) {
     console.error("System API failed:", error);
-    return NextResponse.json({ error: error instanceof Error ? error.message : "Database operation failed." }, { status: 500 });
+    const message = error instanceof Error ? error.message : "Database operation failed.";
+    const status = message === "Farmer already exists with this Phone Number and ID Number." ? 409 : 500;
+    return NextResponse.json({ error: message }, { status });
   }
 }

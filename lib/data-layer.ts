@@ -18,6 +18,24 @@ import type {
 import type { UserRole } from "@/lib/app-data";
 import type { RowDataPacket } from "mysql2";
 import { createHash, randomInt } from "node:crypto";
+import {
+  buildFarmerAddress,
+  isValidNationalId,
+  isValidRwandaPhoneNumber,
+  normalizeNationalId,
+  normalizePhoneNumber,
+} from "@/lib/farmer-validation";
+import { isValidCompleteRwandaAddress } from "@/lib/rwanda-address-server";
+
+function isDuplicateKeyError(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "ER_DUP_ENTRY");
+}
+
+function isFarmerCompositeDuplicate(error: unknown): boolean {
+  if (!isDuplicateKeyError(error)) return false;
+  const message = String((error as { sqlMessage?: string; message?: string }).sqlMessage ?? (error as { message?: string }).message ?? "");
+  return message.includes("uq_farmers_phone_national_id") || message.includes("farmers.phone");
+}
 
 function parseMccIds(value: unknown): string[] {
   if (Array.isArray(value)) {
@@ -42,12 +60,15 @@ function hashOtp(otp: string): string {
   return createHash("sha256").update(otp).digest("hex");
 }
 
+const MAX_OTP_RESENDS = 3;
+const OTP_VALIDITY_MS = 10 * 60 * 1000;
+
 export async function createCowRegistrationBatch(input: {
   batchId: string;
   farmerId: string;
   requestedBy: string;
   cows: CowRegistrationInput[];
-}): Promise<{ batchId: string; expiresAt: string }> {
+}): Promise<{ batchId: string; expiresAt: string; supersededBatchId?: string }> {
   if (!input.batchId || !input.farmerId || !input.requestedBy || !input.cows.length) {
     throw new Error("Select a farmer and add at least one cow.");
   }
@@ -78,8 +99,23 @@ export async function createCowRegistrationBatch(input: {
     );
     if (existingBatch.length) throw new Error("This cow-registration batch already exists.");
 
+    // Only one active OTP per farmer is allowed; a new request supersedes (cancels) any still-pending one.
+    const [pendingBatches] = await connection.execute<RowDataPacket[]>(
+      `SELECT b.batch_id FROM cow_registration_batches b
+       JOIN cow_registration_authorizations a ON a.batch_id = b.batch_id
+       WHERE b.farmer_id = ? AND b.status = 'PENDING_AUTHORIZATION' AND a.status = 'PENDING' FOR UPDATE`,
+      [input.farmerId],
+    );
+    let supersededBatchId: string | undefined;
+    for (const row of pendingBatches) {
+      const previousBatchId = String(row.batch_id);
+      await connection.execute("UPDATE cow_registration_batches SET status = 'CANCELLED', cancelled_at = NOW() WHERE batch_id = ?", [previousBatchId]);
+      await connection.execute("UPDATE cow_registration_authorizations SET status = 'CANCELLED', cancelled_at = NOW() WHERE batch_id = ?", [previousBatchId]);
+      supersededBatchId = previousBatchId;
+    }
+
     const otp = String(randomInt(100000, 1000000));
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    const expiresAt = new Date(Date.now() + OTP_VALIDITY_MS);
     const createdAt = new Date();
     const authorizationSessionId = `AUTH-SESSION-${Date.now()}-${randomInt(1000, 9999)}`;
     await connection.execute(
@@ -103,7 +139,7 @@ export async function createCowRegistrationBatch(input: {
     }
     await connection.commit();
     console.info(`Cow registration OTP ${otp} generated for farmer ${input.farmerId}; deliver to the farmer phone.`);
-    return { batchId: input.batchId, expiresAt: expiresAt.toISOString() };
+    return { batchId: input.batchId, expiresAt: expiresAt.toISOString(), supersededBatchId };
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -161,7 +197,8 @@ export async function listCowRegistrationSessions(): Promise<CowRegistrationSess
   const [rows] = await mysqlPool.execute<RowDataPacket[]>(
     `SELECT b.batch_id, b.farmer_id, f.full_name AS farmer_name, f.phone AS farmer_phone,
             b.requested_by, u.full_name AS requested_by_name, b.status, a.authorization_session_id,
-            a.otp_code, a.created_at, a.expires_at, a.verified_at, a.used_at, a.failed_attempts,
+            a.otp_code, a.created_at, a.expires_at, a.verified_at, a.used_at, a.cancelled_at,
+            a.failed_attempts, a.resend_count,
             COUNT(bc.id) AS cow_count,
             GROUP_CONCAT(bc.tag_number ORDER BY bc.id SEPARATOR ',') AS cow_tags
      FROM cow_registration_batches b
@@ -171,7 +208,7 @@ export async function listCowRegistrationSessions(): Promise<CowRegistrationSess
      LEFT JOIN cow_registration_batch_items bc ON bc.batch_id = b.batch_id
      GROUP BY b.batch_id, b.farmer_id, f.full_name, f.phone, b.requested_by, u.full_name,
               b.status, a.authorization_session_id, a.otp_code, a.created_at, a.expires_at,
-              a.verified_at, a.used_at, a.failed_attempts
+              a.verified_at, a.used_at, a.cancelled_at, a.failed_attempts, a.resend_count
      ORDER BY a.created_at DESC`,
   );
   return rows.map((row) => ({
@@ -190,7 +227,9 @@ export async function listCowRegistrationSessions(): Promise<CowRegistrationSess
     expiresAt: new Date(row.expires_at).toISOString(),
     verifiedAt: row.verified_at ? new Date(row.verified_at).toISOString() : undefined,
     usedAt: row.used_at ? new Date(row.used_at).toISOString() : undefined,
+    cancelledAt: row.cancelled_at ? new Date(row.cancelled_at).toISOString() : undefined,
     failedAttempts: Number(row.failed_attempts ?? 0),
+    resendCount: Number(row.resend_count ?? 0),
   }));
 }
 
@@ -235,17 +274,26 @@ export async function verifyCowRegistrationBatch(input: {
     );
     const authorization = rows[0];
     if (!authorization) throw new Error("Registration authorization was not found.");
+    if (authorization.authorization_status === "CANCELLED" || authorization.status === "CANCELLED") {
+      throw new Error("This OTP has been cancelled and is no longer valid.\nPlease start a new cow registration verification.");
+    }
+    if (authorization.authorization_status === "USED" || authorization.status === "REGISTERED") {
+      throw new Error("This cow registration has already been completed.");
+    }
+    if (authorization.authorization_status === "EXPIRED" || authorization.status === "EXPIRED") {
+      throw new Error("This OTP has expired.\nPlease request a new OTP to continue.");
+    }
     if (authorization.status !== "PENDING_AUTHORIZATION" || authorization.authorization_status !== "PENDING") {
       throw new Error("This cow-registration batch is no longer awaiting authorization.");
     }
     if (new Date(authorization.authorization_expires_at).getTime() <= Date.now()) {
       await connection.execute("UPDATE cow_registration_batches SET status = 'EXPIRED' WHERE batch_id = ?", [input.batchId]);
       await connection.execute("UPDATE cow_registration_authorizations SET status = 'EXPIRED' WHERE batch_id = ?", [input.batchId]);
-      throw new Error("The authorization OTP has expired.");
+      throw new Error("This OTP has expired.\nPlease request a new OTP to continue.");
     }
     if (hashOtp(input.otp) !== String(authorization.otp_hash)) {
       await connection.execute("UPDATE cow_registration_authorizations SET failed_attempts = failed_attempts + 1 WHERE batch_id = ?", [input.batchId]);
-      throw new Error("Invalid authorization OTP.");
+      throw new Error("Incorrect OTP.\nPlease check the OTP and try again.");
     }
     const [batchCows] = await connection.execute<RowDataPacket[]>(
       "SELECT * FROM cow_registration_batch_items WHERE batch_id = ? ORDER BY id",
@@ -275,6 +323,94 @@ export async function verifyCowRegistrationBatch(input: {
     connection.release();
   }
 }
+
+export async function cancelCowRegistrationBatch(input: {
+  batchId: string;
+  requestedBy: string;
+}): Promise<{ batchId: string }> {
+  const connection = await mysqlPool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.execute<RowDataPacket[]>(
+      `SELECT b.status AS batch_status, a.status AS authorization_status
+       FROM cow_registration_batches b
+       JOIN cow_registration_authorizations a ON a.batch_id = b.batch_id
+       WHERE b.batch_id = ? AND b.requested_by = ? FOR UPDATE`,
+      [input.batchId, input.requestedBy],
+    );
+    const record = rows[0];
+    if (!record) throw new Error("Registration authorization was not found.");
+    if (record.authorization_status === "CANCELLED") {
+      throw new Error("This OTP has already been cancelled.");
+    }
+    if (record.authorization_status === "USED" || record.batch_status === "REGISTERED") {
+      throw new Error("This cow registration has already been completed and cannot be cancelled.");
+    }
+    if (record.batch_status !== "PENDING_AUTHORIZATION" || record.authorization_status !== "PENDING") {
+      throw new Error("This registration is no longer pending and cannot be cancelled.");
+    }
+    await connection.execute("UPDATE cow_registration_batches SET status = 'CANCELLED', cancelled_at = NOW() WHERE batch_id = ?", [input.batchId]);
+    await connection.execute("UPDATE cow_registration_authorizations SET status = 'CANCELLED', cancelled_at = NOW() WHERE batch_id = ?", [input.batchId]);
+    await connection.commit();
+    return { batchId: input.batchId };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+export async function resendCowRegistrationOtp(input: {
+  batchId: string;
+  requestedBy: string;
+}): Promise<{ batchId: string; expiresAt: string }> {
+  const connection = await mysqlPool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.execute<RowDataPacket[]>(
+      `SELECT b.status AS batch_status, a.status AS authorization_status, a.resend_count
+       FROM cow_registration_batches b
+       JOIN cow_registration_authorizations a ON a.batch_id = b.batch_id
+       WHERE b.batch_id = ? AND b.requested_by = ? FOR UPDATE`,
+      [input.batchId, input.requestedBy],
+    );
+    const record = rows[0];
+    if (!record) throw new Error("Registration authorization was not found.");
+    if (record.authorization_status === "CANCELLED") {
+      throw new Error("This OTP has been cancelled and is no longer valid.\nPlease start a new cow registration verification.");
+    }
+    if (record.authorization_status === "USED" || record.batch_status === "REGISTERED") {
+      throw new Error("This cow registration has already been completed.");
+    }
+    if (record.batch_status !== "PENDING_AUTHORIZATION") {
+      throw new Error("This registration is no longer pending a new OTP cannot be sent.");
+    }
+    if (Number(record.resend_count ?? 0) >= MAX_OTP_RESENDS) {
+      throw new Error("The OTP resend limit has been reached for this registration. Please start a new cow registration.");
+    }
+    const otp = String(randomInt(100000, 1000000));
+    const expiresAt = new Date(Date.now() + OTP_VALIDITY_MS);
+    await connection.execute(
+      `UPDATE cow_registration_authorizations
+       SET otp_hash = ?, otp_code = ?, created_at = NOW(), expires_at = ?, status = 'PENDING',
+           failed_attempts = 0, resend_count = resend_count + 1
+       WHERE batch_id = ?`,
+      [hashOtp(otp), otp, expiresAt, input.batchId],
+    );
+    await connection.execute("UPDATE cow_registration_batches SET expires_at = ? WHERE batch_id = ?", [expiresAt, input.batchId]);
+    await connection.commit();
+    console.info(`Cow registration OTP resent (${otp}) for batch ${input.batchId}; deliver to the farmer phone.`);
+    return { batchId: input.batchId, expiresAt: expiresAt.toISOString() };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+
 
 function toUser(row: any): AppUser {
   return {
@@ -562,10 +698,14 @@ function toFarmer(row: any): Farmer {
     nationalId: row.national_id ? String(row.national_id) : undefined,
     phone: String(row.phone),
     email: row.email ? String(row.email) : undefined,
+    province: row.province ? String(row.province) : undefined,
     district: row.district ? String(row.district) : undefined,
     sector: row.sector ? String(row.sector) : undefined,
     village: row.village ? String(row.village) : undefined,
     cell: row.cell ? String(row.cell) : undefined,
+    fullAddress: row.province && row.district && row.sector && row.cell && row.village
+      ? buildFarmerAddress({ province: String(row.province), district: String(row.district), sector: String(row.sector), cell: String(row.cell), village: String(row.village) })
+      : undefined,
     mccId: String(row.mcc_id),
     mccName: row.mcc_name ? String(row.mcc_name) : undefined,
     registeredBy: row.registered_by ? String(row.registered_by) : undefined,
@@ -873,38 +1013,92 @@ export async function getScopedPhase2Data(user: AppUser): Promise<{
 }
 
 export async function createFarmer(input: Omit<Farmer, "createdAt">): Promise<void> {
-  if (!input.username || !input.email || !input.fullName || !input.phone || !input.nationalId || !input.mccId) {
-    throw new Error("Farmer name, username, email, phone, national ID, and MCC ID are required.");
+  const fullName = input.fullName?.trim();
+  const email = input.email?.trim() || "";
+  const rawPhone = input.phone?.trim() || "";
+  const rawNationalId = input.nationalId?.trim() || "";
+  const normalizedPhone = normalizePhoneNumber(rawPhone);
+  const normalizedNationalId = normalizeNationalId(rawNationalId);
+
+  if (!fullName || !normalizedPhone || !normalizedNationalId || !input.mccId) {
+    throw new Error("Farmer name, phone, national ID, and MCC ID are required.");
   }
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input.email.trim())) {
+  if (!isValidRwandaPhoneNumber(normalizedPhone)) {
+    throw new Error("Enter a valid Rwanda phone number in the format 078XXXXXXX.");
+  }
+  if (!isValidNationalId(normalizedNationalId)) {
+    throw new Error("Enter a valid national ID number.");
+  }
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     throw new Error("Enter a valid farmer email address.");
   }
-  const username = input.username;
+  const province = input.province?.trim() || "";
+  const district = input.district?.trim() || "";
+  const sector = input.sector?.trim() || "";
+  const cell = input.cell?.trim() || "";
+  const village = input.village?.trim() || "";
+  if (!province || !district || !sector || !cell || !village) {
+    throw new Error("Province, district, sector, cell, and village are required.");
+  }
+  if (!isValidCompleteRwandaAddress({ province, district, sector, cell, village })) {
+    throw new Error("The selected Rwanda address hierarchy is invalid. Choose a valid province, district, sector, cell, and village combination.");
+  }
+
+  const username = input.username?.trim() || `farmer_${normalizedPhone.slice(1)}_${normalizedNationalId.slice(-4)}`;
   const password = DEFAULT_INITIAL_PASSWORD;
-  const email = input.email;
   const connection = await mysqlPool.getConnection();
   try {
     await connection.beginTransaction();
     const userId = input.userId ?? `farmer-${Date.now()}`;
-    const [duplicates] = await connection.execute(
-      `SELECT u.uid FROM users u LEFT JOIN farmers f ON f.user_id = u.uid
-       WHERE u.username = ? OR u.email = ? OR f.phone = ? OR f.national_id = ? LIMIT 1`,
-      [username, email, input.phone, input.nationalId],
+    const userEmail = email || `farmer-${userId}@local.invalid`;
+    const [duplicateFarmers] = await connection.execute(
+      `SELECT farmer_id FROM farmers WHERE phone = ? AND national_id = ? LIMIT 1`,
+      [normalizedPhone, normalizedNationalId],
     );
-    if ((duplicates as any[]).length) throw new Error("This farmer is already registered. Check the username, email, phone, or national ID.");
+    if ((duplicateFarmers as any[]).length) {
+      throw new Error("Farmer already exists with this Phone Number and ID Number.");
+    }
+    const [duplicateUsers] = await connection.execute(
+      `SELECT u.uid FROM users u WHERE u.username = ? OR u.email = ? LIMIT 1`,
+      [username, userEmail],
+    );
+    if ((duplicateUsers as any[]).length) throw new Error("A farmer login already exists with this username or email.");
+    const [locationRows] = await connection.execute<RowDataPacket[]>(
+      `SELECT v.id AS village_id
+       FROM provinces p
+       JOIN districts d ON d.province_id = p.id
+       JOIN sectors s ON s.district_id = d.id
+       JOIN cells c ON c.sector_id = s.id
+       JOIN villages v ON v.cell_id = c.id
+       WHERE p.name = ? AND d.name = ? AND s.name = ? AND c.name = ? AND v.name = ?
+       LIMIT 1`,
+      [province, district, sector, cell, village],
+    );
+    if (!locationRows.length) {
+      throw new Error("The selected Rwanda address is not available in the location database. Import the Rwanda location dataset first.");
+    }
+    const villageId = Number(locationRows[0].village_id);
     await connection.execute(
       `INSERT INTO users (uid, username, full_name, email, password, role, mcc_ids, status, must_change_password)
        VALUES (?, ?, ?, ?, ?, 'FARMER', JSON_ARRAY(?), 'ACTIVE', 1)`,
-      [userId, username, input.fullName, email, password, input.mccId],
+      [userId, username, fullName, userEmail, password, input.mccId],
     );
     await connection.execute(
-      `INSERT INTO farmers (farmer_id, user_id, registered_by, full_name, national_id, phone, email, district, sector, cell, village, mcc_id, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [input.farmerId, userId, input.registeredBy ?? null, input.fullName, input.nationalId ?? null, input.phone, email, input.district ?? null, input.sector ?? null, input.cell ?? null, input.village ?? null, input.mccId, input.status],
+      `INSERT INTO farmers (farmer_id, user_id, registered_by, full_name, national_id, phone, email, province, district, sector, cell, village, province_id, district_id, sector_id, cell_id, village_id, mcc_id, status)
+       SELECT ?, ?, ?, ?, ?, ?, ?, p.name, d.name, s.name, c.name, v.name, p.id, d.id, s.id, c.id, v.id, ?, ?
+       FROM provinces p
+       JOIN districts d ON d.province_id = p.id
+       JOIN sectors s ON s.district_id = d.id
+       JOIN cells c ON c.sector_id = s.id
+       JOIN villages v ON v.cell_id = c.id
+       WHERE p.name = ? AND d.name = ? AND s.name = ? AND c.name = ? AND v.name = ?
+       LIMIT 1`,
+      [input.farmerId, userId, input.registeredBy ?? null, fullName, normalizedNationalId, normalizedPhone, email || null, input.mccId, input.status, province, district, sector, cell, village],
     );
     await connection.commit();
   } catch (error) {
     await connection.rollback();
+    if (isFarmerCompositeDuplicate(error)) throw new Error("Farmer already exists with this Phone Number and ID Number.");
     throw error;
   } finally {
     connection.release();
@@ -981,13 +1175,54 @@ export async function createAnimal(input: Omit<Animal, "createdAt">): Promise<vo
   );
 }
 
-export async function updateFarmerForCollector(input: Pick<Farmer, "farmerId" | "fullName" | "phone" | "email" | "nationalId">, collectorId: string, allFarmers = false): Promise<void> {
-  await mysqlPool.execute(
-    `UPDATE farmers f LEFT JOIN users u ON u.uid = f.user_id
-     SET f.full_name = ?, f.phone = ?, f.email = ?, f.national_id = ?, u.full_name = ?, u.email = ?
-     WHERE f.farmer_id = ? ${allFarmers ? "" : "AND f.registered_by = ?"}`,
-    [input.fullName, input.phone, input.email ?? null, input.nationalId ?? null, input.fullName, input.email ?? null, input.farmerId, ...(allFarmers ? [] : [collectorId])],
+export async function updateFarmerForCollector(input: Pick<Farmer, "farmerId" | "fullName" | "phone" | "email" | "nationalId" | "province" | "district" | "sector" | "cell" | "village">, collectorId: string, allFarmers = false): Promise<void> {
+  const fullName = input.fullName?.trim() || "";
+  const email = input.email?.trim() || "";
+  const normalizedPhone = normalizePhoneNumber(input.phone ?? "");
+  const normalizedNationalId = normalizeNationalId(input.nationalId ?? "");
+  if (!fullName || !normalizedPhone || !normalizedNationalId) throw new Error("Farmer name, phone number, and national ID are required.");
+  if (!isValidRwandaPhoneNumber(normalizedPhone)) throw new Error("Enter a valid Rwanda phone number in the format 078XXXXXXX.");
+  if (!isValidNationalId(normalizedNationalId)) throw new Error("Enter a valid national ID number.");
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("Enter a valid farmer email address.");
+  const province = input.province?.trim() || "";
+  const district = input.district?.trim() || "";
+  const sector = input.sector?.trim() || "";
+  const cell = input.cell?.trim() || "";
+  const village = input.village?.trim() || "";
+  if (!province || !district || !sector || !cell || !village || !isValidCompleteRwandaAddress({ province, district, sector, cell, village })) {
+    throw new Error("Province, district, sector, cell, and village must be a valid Rwanda address hierarchy.");
+  }
+  const [locationRows] = await mysqlPool.execute<RowDataPacket[]>(
+    `SELECT p.id AS province_id, d.id AS district_id, s.id AS sector_id, c.id AS cell_id, v.id AS village_id
+     FROM provinces p
+     JOIN districts d ON d.province_id = p.id
+     JOIN sectors s ON s.district_id = d.id
+     JOIN cells c ON c.sector_id = s.id
+     JOIN villages v ON v.cell_id = c.id
+     WHERE p.name = ? AND d.name = ? AND s.name = ? AND c.name = ? AND v.name = ? LIMIT 1`,
+    [province, district, sector, cell, village],
   );
+  if (!locationRows.length) throw new Error("The selected Rwanda address is not available in the location database.");
+  const [duplicateRows] = await mysqlPool.execute<RowDataPacket[]>(
+    `SELECT farmer_id FROM farmers WHERE phone = ? AND national_id = ? AND farmer_id <> ? LIMIT 1`,
+    [normalizedPhone, normalizedNationalId, input.farmerId],
+  );
+  if (duplicateRows.length) throw new Error("Farmer already exists with this Phone Number and ID Number.");
+  try {
+    await mysqlPool.execute(
+      `UPDATE farmers f LEFT JOIN users u ON u.uid = f.user_id
+       SET f.full_name = ?, f.phone = ?, f.email = ?, f.national_id = ?, f.province = ?, f.district = ?, f.sector = ?, f.cell = ?, f.village = ?,
+           f.province_id = ?, f.district_id = ?, f.sector_id = ?, f.cell_id = ?, f.village_id = ?,
+           u.full_name = ?, u.email = COALESCE(NULLIF(?, ''), u.email)
+       WHERE f.farmer_id = ? ${allFarmers ? "" : "AND f.registered_by = ?"}`,
+      [fullName, normalizedPhone, email || null, normalizedNationalId, province, district, sector, cell, village,
+        locationRows[0].province_id, locationRows[0].district_id, locationRows[0].sector_id, locationRows[0].cell_id, locationRows[0].village_id,
+        fullName, email || null, input.farmerId, ...(allFarmers ? [] : [collectorId])],
+    );
+  } catch (error) {
+    if (isFarmerCompositeDuplicate(error)) throw new Error("Farmer already exists with this Phone Number and ID Number.");
+    throw error;
+  }
 }
 
 export async function deleteFarmerForCollector(farmerId: string, collectorId: string, allFarmers = false): Promise<void> {

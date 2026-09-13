@@ -153,15 +153,58 @@ VALUES
 ON DUPLICATE KEY UPDATE
   value_text = VALUES(value_text);
 
+CREATE TABLE IF NOT EXISTS provinces (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  code VARCHAR(50) NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS districts (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  province_id INT NOT NULL,
+  name VARCHAR(255) NOT NULL,
+  code VARCHAR(50) NOT NULL UNIQUE,
+  UNIQUE KEY uq_district_province_name (province_id, name),
+  CONSTRAINT fk_districts_province FOREIGN KEY (province_id) REFERENCES provinces(id)
+);
+
+CREATE TABLE IF NOT EXISTS sectors (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  district_id INT NOT NULL,
+  name VARCHAR(255) NOT NULL,
+  code VARCHAR(50) NOT NULL UNIQUE,
+  UNIQUE KEY uq_sector_district_name (district_id, name),
+  CONSTRAINT fk_sectors_district FOREIGN KEY (district_id) REFERENCES districts(id)
+);
+
+CREATE TABLE IF NOT EXISTS cells (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  sector_id INT NOT NULL,
+  name VARCHAR(255) NOT NULL,
+  code VARCHAR(50) NOT NULL UNIQUE,
+  UNIQUE KEY uq_cell_sector_name (sector_id, name),
+  CONSTRAINT fk_cells_sector FOREIGN KEY (sector_id) REFERENCES sectors(id)
+);
+
+CREATE TABLE IF NOT EXISTS villages (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  cell_id INT NOT NULL,
+  name VARCHAR(255) NOT NULL,
+  code VARCHAR(50) NOT NULL UNIQUE,
+  UNIQUE KEY uq_village_cell_name (cell_id, name),
+  CONSTRAINT fk_villages_cell FOREIGN KEY (cell_id) REFERENCES cells(id)
+);
+
 CREATE TABLE IF NOT EXISTS farmers (
   id INT AUTO_INCREMENT PRIMARY KEY,
   farmer_id VARCHAR(100) NOT NULL UNIQUE,
   user_id VARCHAR(100) UNIQUE,
   registered_by VARCHAR(100),
   full_name VARCHAR(255) NOT NULL,
-  national_id VARCHAR(100) UNIQUE,
+  national_id VARCHAR(100) NOT NULL,
   phone VARCHAR(50) NOT NULL,
   email VARCHAR(255),
+  province VARCHAR(255) NULL,
   district VARCHAR(255),
   sector VARCHAR(255),
   cell VARCHAR(255),
@@ -171,11 +214,20 @@ CREATE TABLE IF NOT EXISTS farmers (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NULL DEFAULT NULL,
   INDEX idx_farmers_mcc (mcc_id),
+  UNIQUE KEY uq_farmers_phone_national_id (phone, national_id),
   CONSTRAINT fk_farmers_mcc FOREIGN KEY (mcc_id) REFERENCES mccs(mcc_id)
 );
 
 ALTER TABLE farmers ADD COLUMN IF NOT EXISTS user_id VARCHAR(100) UNIQUE;
 ALTER TABLE farmers ADD COLUMN IF NOT EXISTS registered_by VARCHAR(100);
+ALTER TABLE farmers ADD COLUMN IF NOT EXISTS province VARCHAR(255) NULL;
+ALTER TABLE farmers ADD COLUMN IF NOT EXISTS province_id INT NULL;
+ALTER TABLE farmers ADD COLUMN IF NOT EXISTS district_id INT NULL;
+ALTER TABLE farmers ADD COLUMN IF NOT EXISTS sector_id INT NULL;
+ALTER TABLE farmers ADD COLUMN IF NOT EXISTS cell_id INT NULL;
+ALTER TABLE farmers ADD COLUMN IF NOT EXISTS village_id INT NULL;
+ALTER TABLE farmers ADD UNIQUE INDEX IF NOT EXISTS uq_farmers_phone_national_id (phone, national_id);
+ALTER TABLE farmers MODIFY COLUMN national_id VARCHAR(100) NOT NULL;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(100);
 
 CREATE TABLE IF NOT EXISTS cow_registration_batches (
@@ -189,10 +241,12 @@ CREATE TABLE IF NOT EXISTS cow_registration_batches (
   created_at DATETIME NOT NULL,
   expires_at DATETIME NOT NULL,
   authorized_at DATETIME NULL,
+  cancelled_at DATETIME NULL,
   INDEX idx_cow_registration_batches_farmer (farmer_id, status),
   INDEX idx_cow_registration_batches_requester (requested_by, status),
   CONSTRAINT fk_cow_registration_batch_farmer FOREIGN KEY (farmer_id) REFERENCES farmers(farmer_id)
 );
+ALTER TABLE cow_registration_batches ADD COLUMN IF NOT EXISTS cancelled_at DATETIME NULL;
 
 CREATE TABLE IF NOT EXISTS cow_registration_authorizations (
   id INT AUTO_INCREMENT PRIMARY KEY,
@@ -205,12 +259,16 @@ CREATE TABLE IF NOT EXISTS cow_registration_authorizations (
   expires_at DATETIME NOT NULL,
   verified_at DATETIME NULL,
   used_at DATETIME NULL,
+  cancelled_at DATETIME NULL,
   failed_attempts INT NOT NULL DEFAULT 0,
+  resend_count INT NOT NULL DEFAULT 0,
   status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
   INDEX idx_cow_auth_farmer_status (farmer_id, status),
   CONSTRAINT fk_cow_registration_auth_batch FOREIGN KEY (batch_id) REFERENCES cow_registration_batches(batch_id),
   CONSTRAINT fk_cow_registration_auth_farmer FOREIGN KEY (farmer_id) REFERENCES farmers(farmer_id)
 );
+ALTER TABLE cow_registration_authorizations ADD COLUMN IF NOT EXISTS cancelled_at DATETIME NULL;
+ALTER TABLE cow_registration_authorizations ADD COLUMN IF NOT EXISTS resend_count INT NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS cow_registration_batch_items (
   id INT AUTO_INCREMENT PRIMARY KEY,

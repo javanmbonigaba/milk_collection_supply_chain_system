@@ -6,6 +6,12 @@ import QRCode from "qrcode";
 import { AppShell, AccessDenied, AuthGuard } from "@/components/layout/app-shell";
 import { useAuth } from "@/components/auth/auth-provider";
 import { hasPermission } from "@/lib/auth/roles";
+import {
+  buildFarmerAddress,
+  isValidNationalId,
+  isValidRwandaPhoneNumber,
+  normalizePhoneNumber,
+} from "@/lib/farmer-validation";
 import type { Animal, BreedType, CollectorBatchAssignment, CowRegistrationAuthorization, Farmer, FarmerPayment, MilkBatch, MilkCollection, Phase2Summary, QualityTest, VeterinaryRecord } from "@/lib/phase2-data";
 
 type Phase2State = {
@@ -31,10 +37,41 @@ type ConfirmationDialog = {
   onConfirm: () => void;
 };
 
+type RwandaAddressOptions = {
+  provinces: string[];
+  districts: string[];
+  sectors: string[];
+  cells: string[];
+  villages: string[];
+};
+
+type CowBatchDraft = {
+  animalId: string;
+  farmerId: string;
+  tagNumber: string;
+  breed: string;
+  sex: Animal["sex"];
+  status: "ACTIVE";
+};
+
 function formatTimestamp(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
+
+function maskPhoneNumber(phone: string): string {
+  const digits = phone.trim();
+  if (digits.length <= 4) return digits;
+  return `${digits.slice(0, 2)}${"*".repeat(Math.max(digits.length - 4, 0))}${digits.slice(-2)}`;
+}
+
+function formatCountdown(totalSeconds: number): string {
+  const clamped = Math.max(totalSeconds, 0);
+  const minutes = Math.floor(clamped / 60);
+  const seconds = clamped % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
 
 function InteractivePieChart({ title, slices, selected, onSelect }: { title: string; slices: ChartSlice[]; selected: number; onSelect: (index: number) => void }) {
   const total = slices.reduce((sum, slice) => sum + slice.value, 0);
@@ -121,7 +158,9 @@ export default function OperationsPage({ managementOnly = false }: { managementO
   const [editingVeterinaryRecord, setEditingVeterinaryRecord] = useState<string | null>(null);
   const [veterinaryDateForm, setVeterinaryDateForm] = useState({ visitDate: "", withdrawalUntil: "" });
   const [collectors, setCollectors] = useState<Array<{ uid: string; fullName: string }>>([]);
-  const [farmerForm, setFarmerForm] = useState({ fullName: "", username: "", password: "", email: "", phone: "", nationalId: "", district: "", sector: "", cell: "", village: "", mccId: "MCC-001", collectorId: "" });
+  const [addressOptions, setAddressOptions] = useState<RwandaAddressOptions>({ provinces: [], districts: [], sectors: [], cells: [], villages: [] });
+  const [addressLoading, setAddressLoading] = useState(false);
+  const [farmerForm, setFarmerForm] = useState({ fullName: "", username: "", password: "", email: "", phone: "", nationalId: "", province: "", district: "", sector: "", cell: "", village: "", mccId: "MCC-001", collectorId: "" });
   const [animalForm, setAnimalForm] = useState({ farmerId: "", tagNumber: "", breed: "", sex: "FEMALE" as Animal["sex"] });
   const [verifiedFarmer, setVerifiedFarmer] = useState<Farmer | null>(null);
   const [vetFarmerId, setVetFarmerId] = useState("");
@@ -150,10 +189,23 @@ export default function OperationsPage({ managementOnly = false }: { managementO
   const [selectedChartSlice, setSelectedChartSlice] = useState({ ownership: 0, collections: 0 });
   const [cowBatchFarmerId, setCowBatchFarmerId] = useState("");
   const [cowFarmerSearch, setCowFarmerSearch] = useState("");
-  const [cowBatchCows, setCowBatchCows] = useState<Array<{ animalId: string; farmerId: string; tagNumber: string; breed: string; sex: Animal["sex"]; status: "ACTIVE" }>>([]);
+  const [cowBatchCows, setCowBatchCows] = useState<CowBatchDraft[]>([]);
   const [cowDraft, setCowDraft] = useState({ tagNumber: "", breed: "", sex: "FEMALE" as Animal["sex"] });
-  const [pendingCowBatch, setPendingCowBatch] = useState<{ batchId: string; farmerId: string; cowCount: number; expiresAt: string } | null>(null);
+  // Backup of the cows submitted with the current pending OTP so they can be restored on cancel.
+  const [cowBatchBackup, setCowBatchBackup] = useState<CowBatchDraft[]>([]);
+  const [pendingCowBatch, setPendingCowBatch] = useState<{
+    batchId: string;
+    farmerId: string;
+    farmerName: string;
+    farmerPhone: string;
+    cowCount: number;
+    cows: Array<{ tagNumber: string; breed: string }>;
+    expiresAt: string;
+  } | null>(null);
   const [cowBatchOtp, setCowBatchOtp] = useState("");
+  const [cowBatchBusy, setCowBatchBusy] = useState<"idle" | "generating" | "verifying" | "cancelling" | "resending">("idle");
+  const [cowBatchOtpExpired, setCowBatchOtpExpired] = useState(false);
+  const [cowBatchOtpSecondsLeft, setCowBatchOtpSecondsLeft] = useState(0);
   const matchingCowFarmers = (state?.farmers ?? []).filter((farmer) => {
     const query = cowFarmerSearch.trim().toLowerCase();
     return !query || [farmer.fullName, farmer.nationalId, farmer.phone].some((value) =>
@@ -170,6 +222,53 @@ export default function OperationsPage({ managementOnly = false }: { managementO
       .catch(() => { if (active) setMessage("Phase 2 data could not be loaded. Check that the MySQL migration has been run."); });
     return () => { active = false; };
   }, [user?.uid]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = true;
+    setAddressLoading(true);
+    fetch("/api/system", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "rwandaAddressOptions", data: farmerForm }),
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Address options request failed.");
+        return response.json() as Promise<RwandaAddressOptions>;
+      })
+      .then((data) => {
+        if (!active) return;
+        setAddressOptions({
+          provinces: Array.isArray(data.provinces) ? data.provinces : [],
+          districts: Array.isArray(data.districts) ? data.districts : [],
+          sectors: Array.isArray(data.sectors) ? data.sectors : [],
+          cells: Array.isArray(data.cells) ? data.cells : [],
+          villages: Array.isArray(data.villages) ? data.villages : [],
+        });
+      })
+      .catch((error: unknown) => {
+        if (active && error instanceof Error && error.name !== "AbortError") setMessage("Rwanda address options could not be loaded.");
+      })
+      .finally(() => { if (active) setAddressLoading(false); });
+    return () => { active = false; controller.abort(); };
+  }, [farmerForm.province, farmerForm.district, farmerForm.sector, farmerForm.cell]);
+
+  useEffect(() => {
+    if (!pendingCowBatch) {
+      setCowBatchOtpSecondsLeft(0);
+      return;
+    }
+    function tick() {
+      if (!pendingCowBatch) return;
+      const secondsLeft = Math.max(Math.round((new Date(pendingCowBatch.expiresAt).getTime() - Date.now()) / 1000), 0);
+      setCowBatchOtpSecondsLeft(secondsLeft);
+      if (secondsLeft === 0) setCowBatchOtpExpired(true);
+    }
+    tick();
+    const interval = setInterval(tick, 1000);
+    return () => clearInterval(interval);
+  }, [pendingCowBatch?.batchId, pendingCowBatch?.expiresAt]);
 
   useEffect(() => {
     if (user?.role !== "MILK_COLLECTOR") return;
@@ -217,6 +316,48 @@ export default function OperationsPage({ managementOnly = false }: { managementO
   const currentUser = user;
   const showSection = (section: string) => managementOnly || activeSection === section;
   const currentState = state ?? initialState;
+  const provinceOptions = addressOptions.provinces;
+  const districtOptions = addressOptions.districts;
+  const sectorOptions = addressOptions.sectors;
+  const cellOptions = addressOptions.cells;
+  const villageOptions = addressOptions.villages;
+  const generatedFarmerAddress = buildFarmerAddress({ province: farmerForm.province, district: farmerForm.district, sector: farmerForm.sector, cell: farmerForm.cell, village: farmerForm.village });
+  const updateAddressSelection = (field: "province" | "district" | "sector" | "cell" | "village", value: string) => {
+    setAddressOptions((current) => ({
+      provinces: current.provinces,
+      districts: field === "province" ? [] : current.districts,
+      sectors: field === "province" || field === "district" ? [] : current.sectors,
+      cells: field === "province" || field === "district" || field === "sector" ? [] : current.cells,
+      villages: field === "province" || field === "district" || field === "sector" || field === "cell" ? [] : current.villages,
+    }));
+    setFarmerForm((current) => {
+      const next = { ...current, [field]: value };
+      if (field !== "province") next.province = current.province;
+      if (field !== "district") next.district = current.district;
+      if (field !== "sector") next.sector = current.sector;
+      if (field !== "cell") next.cell = current.cell;
+      if (field !== "village") next.village = current.village;
+      if (field === "province") {
+        next.district = "";
+        next.sector = "";
+        next.cell = "";
+        next.village = "";
+      }
+      if (field === "district") {
+        next.sector = "";
+        next.cell = "";
+        next.village = "";
+      }
+      if (field === "sector") {
+        next.cell = "";
+        next.village = "";
+      }
+      if (field === "cell") {
+        next.village = "";
+      }
+      return next;
+    });
+  };
   const canWrite = hasPermission(currentUser.role, "operations.write");
   const isManagementRole = ["SUPER_ADMIN", "ADMIN", "MCC_MANAGER"].includes(currentUser.role);
   const canRegisterFarmer = isManagementRole || ["MCC_OFFICER", "MILK_COLLECTOR", "VETERINARY_OFFICER"].includes(currentUser.role);
@@ -488,7 +629,7 @@ export default function OperationsPage({ managementOnly = false }: { managementO
     try {
       await postAction(action, data, currentUser.uid);
       await refresh();
-      if (action === "createFarmer") setFarmerForm({ fullName: "", username: "", password: "", email: "", phone: "", nationalId: "", district: "", sector: "", cell: "", village: "", mccId: "MCC-001", collectorId: "" });
+      if (action === "createFarmer") setFarmerForm({ fullName: "", username: "", password: "", email: "", phone: "", nationalId: "", province: "", district: "", sector: "", cell: "", village: "", mccId: "MCC-001", collectorId: "" });
       if (action === "createAnimal") {
         setAnimalForm({ farmerId: "", tagNumber: "", breed: "", sex: "FEMALE" });
         setVerifiedFarmer(null);
@@ -525,6 +666,28 @@ export default function OperationsPage({ managementOnly = false }: { managementO
       { title, message: messageText, confirmLabel: destructive ? "Delete record" : "Save changes", destructive },
       () => { void manageRecord(action, data); },
     );
+  }
+
+  function requestFarmerUpdate() {
+    if (!editingFarmer) return;
+    const normalizedPhone = normalizePhoneNumber(editingFarmer.phone);
+    if (!isValidRwandaPhoneNumber(normalizedPhone)) {
+      setMessage("Enter a valid Rwanda phone number in the format 078XXXXXXX.");
+      return;
+    }
+    if (!isValidNationalId(editingFarmer.nationalId ?? "")) {
+      setMessage("Enter a valid 16-digit national ID number.");
+      return;
+    }
+    if (editingFarmer.email && !isValidEmail(editingFarmer.email)) {
+      setMessage("Enter a valid farmer email address before saving.");
+      return;
+    }
+    if (!farmerForm.province || !farmerForm.district || !farmerForm.sector || !farmerForm.cell || !farmerForm.village) {
+      setMessage("Select a complete Rwanda address before saving the farmer.");
+      return;
+    }
+    requestManageConfirmation("updateFarmer", { ...editingFarmer, phone: normalizedPhone, province: farmerForm.province, district: farmerForm.district, sector: farmerForm.sector, cell: farmerForm.cell, village: farmerForm.village }, "Confirm changes", "Save your changes to this farmer record?");
   }
 
   async function verifyFarmer() {
@@ -571,6 +734,16 @@ export default function OperationsPage({ managementOnly = false }: { managementO
       setMessage("");
     }
 
+  function startEditCowBatchCow(cow: CowBatchDraft) {
+    setCowDraft({ tagNumber: cow.tagNumber, breed: cow.breed, sex: cow.sex });
+    setCowBatchCows((current) => current.filter((item) => item.animalId !== cow.animalId));
+    setMessage("Cow moved back into the form for editing. Update the fields and choose Add another cow, or resubmit the batch.");
+  }
+
+  function removeCowBatchCow(animalId: string) {
+    setCowBatchCows((current) => current.filter((item) => item.animalId !== animalId));
+  }
+
   async function submitCowBatch() {
       const cowsToSubmit = [...cowBatchCows];
       if (cowDraft.tagNumber.trim() || cowDraft.breed.trim()) {
@@ -591,6 +764,13 @@ export default function OperationsPage({ managementOnly = false }: { managementO
         setMessage("Select a farmer and add at least one cow before requesting authorization.");
         return;
       }
+      const farmer = (state?.farmers ?? []).find((item) => item.farmerId === cowBatchFarmerId);
+      if (!farmer) {
+        setMessage("Select a valid farmer before requesting authorization.");
+        return;
+      }
+      setCowBatchBusy("generating");
+      setMessage("Generating OTP...");
       try {
         const response = await fetch("/api/system", {
           method: "POST",
@@ -603,17 +783,39 @@ export default function OperationsPage({ managementOnly = false }: { managementO
         });
         const result = await response.json();
         if (!response.ok) throw new Error(result.error ?? "Authorization request failed.");
-        setPendingCowBatch({ batchId: result.batchId, farmerId: cowBatchFarmerId, cowCount: cowsToSubmit.length, expiresAt: result.expiresAt });
+        setPendingCowBatch({
+          batchId: result.batchId,
+          farmerId: cowBatchFarmerId,
+          farmerName: farmer.fullName,
+          farmerPhone: farmer.phone,
+          cowCount: cowsToSubmit.length,
+          cows: cowsToSubmit.map((cow) => ({ tagNumber: cow.tagNumber, breed: cow.breed })),
+          expiresAt: result.expiresAt,
+        });
+        // Back up the submitted cows so Cancel OTP can restore them for editing.
+        setCowBatchBackup(cowsToSubmit);
+        setCowBatchOtpExpired(false);
         setCowBatchCows([]);
         setCowDraft({ tagNumber: "", breed: "", sex: "FEMALE" });
         setMessage("One OTP was sent to the farmer phone and is visible on the farmer dashboard.");
       } catch (error) {
         setMessage(error instanceof Error ? error.message : "Authorization request failed.");
+      } finally {
+        setCowBatchBusy("idle");
       }
     }
 
+  function resetCowRegistrationVerification() {
+    setPendingCowBatch(null);
+    setCowBatchOtp("");
+    setCowBatchOtpExpired(false);
+    setCowBatchOtpSecondsLeft(0);
+  }
+
   async function verifyCowBatchOtp() {
-      if (!pendingCowBatch) return;
+      if (!pendingCowBatch || cowBatchBusy !== "idle") return;
+      setCowBatchBusy("verifying");
+      setMessage("Verifying OTP...");
       try {
         const response = await fetch("/api/system", {
           method: "POST",
@@ -625,13 +827,86 @@ export default function OperationsPage({ managementOnly = false }: { managementO
           }),
         });
         const result = await response.json();
-        if (!response.ok) throw new Error(result.error ?? "OTP verification failed.");
-        setPendingCowBatch(null);
-        setCowBatchOtp("");
+        if (!response.ok) throw new Error(result.error ?? "Unable to process the request.\nPlease try again.");
+        setCowBatchBackup([]);
+        resetCowRegistrationVerification();
         await refresh();
         setMessage(`${result.registeredCount} cows registered. Farmer authorization was confirmed by the OTP.`);
       } catch (error) {
-        setMessage(error instanceof Error ? error.message : "OTP verification failed.");
+        setMessage(error instanceof Error ? error.message : "Unable to process the request.\nPlease try again.");
+      } finally {
+        setCowBatchBusy("idle");
+    }
+  }
+
+  function requestCancelCowRegistration() {
+    if (!pendingCowBatch || cowBatchBusy !== "idle") return;
+    setConfirmationDialog({
+      title: "Cancel OTP Verification?",
+      message: "Are you sure you want to cancel this cow registration verification? The current OTP will become invalid, but the cows you submitted will be restored so you can edit them and submit again.",
+      confirmLabel: "Yes, Cancel",
+      destructive: true,
+      onConfirm: () => void cancelCowBatchOtp(),
+    });
+  }
+
+  async function cancelCowBatchOtp() {
+    if (!pendingCowBatch) return;
+    const batchId = pendingCowBatch.batchId;
+    const farmerId = pendingCowBatch.farmerId;
+    const farmerName = pendingCowBatch.farmerName;
+    setCowBatchBusy("cancelling");
+    setMessage("Cancelling OTP...");
+    try {
+      const response = await fetch("/api/system", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "cancelCowRegistrationBatch", userId: currentUser.uid, data: { batchId } }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error ?? "Unable to process the request.\nPlease try again.");
+
+      // Restore the cows and re-select the farmer so the user can continue editing.
+      const restoredCows = cowBatchBackup.length ? cowBatchBackup : [];
+      setCowBatchCows(restoredCows);
+      setCowBatchFarmerId(farmerId);
+      setCowFarmerSearch(farmerName);
+      setCowBatchBackup([]);
+      setCowDraft({ tagNumber: "", breed: "", sex: "FEMALE" });
+
+      resetCowRegistrationVerification();
+      setMessage(
+        restoredCows.length
+          ? "Cow registration verification cancelled successfully.\nThe cows have been restored so you can edit and resubmit."
+          : "Cow registration verification cancelled successfully.\nNo cow registration was completed.",
+      );
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to process the request.\nPlease try again.");
+    } finally {
+      setCowBatchBusy("idle");
+    }
+  }
+
+  async function resendCowBatchOtp() {
+    if (!pendingCowBatch || cowBatchBusy !== "idle") return;
+    setCowBatchBusy("resending");
+    setMessage("Generating OTP...");
+    try {
+      const response = await fetch("/api/system", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "resendCowRegistrationOtp", userId: currentUser.uid, data: { batchId: pendingCowBatch.batchId } }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error ?? "Unable to process the request.\nPlease try again.");
+      setPendingCowBatch((current) => (current ? { ...current, expiresAt: result.expiresAt } : current));
+      setCowBatchOtp("");
+      setCowBatchOtpExpired(false);
+      setMessage("A new OTP was sent to the farmer phone. The previous OTP is no longer valid.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to process the request.\nPlease try again.");
+    } finally {
+      setCowBatchBusy("idle");
     }
   }
 
@@ -705,6 +980,12 @@ export default function OperationsPage({ managementOnly = false }: { managementO
                     <input value={editingFarmer.phone} onChange={(e) => setEditingFarmer({ ...editingFarmer, phone: e.target.value })} placeholder="Phone" className="rounded-xl border px-3 py-2" />
                     <input value={editingFarmer.email ?? ""} onChange={(e) => setEditingFarmer({ ...editingFarmer, email: e.target.value })} placeholder="Email" className="rounded-xl border px-3 py-2" />
                     <input value={editingFarmer.nationalId ?? ""} onChange={(e) => setEditingFarmer({ ...editingFarmer, nationalId: e.target.value })} placeholder="National ID" className="rounded-xl border px-3 py-2" />
+                    <select value={farmerForm.province} onChange={(e) => updateAddressSelection("province", e.target.value)} className="rounded-xl border px-3 py-2"><option value="">Select Province</option>{provinceOptions.map((province) => <option key={province} value={province}>{province}</option>)}</select>
+                    <select value={farmerForm.district} onChange={(e) => updateAddressSelection("district", e.target.value)} disabled={!farmerForm.province} className="rounded-xl border px-3 py-2"><option value="">Select District</option>{districtOptions.map((district: string) => <option key={district} value={district}>{district}</option>)}</select>
+                    <select value={farmerForm.sector} onChange={(e) => updateAddressSelection("sector", e.target.value)} disabled={!farmerForm.district} className="rounded-xl border px-3 py-2"><option value="">Select Sector</option>{sectorOptions.map((sector: string) => <option key={sector} value={sector}>{sector}</option>)}</select>
+                    <select value={farmerForm.cell} onChange={(e) => updateAddressSelection("cell", e.target.value)} disabled={!farmerForm.sector} className="rounded-xl border px-3 py-2"><option value="">Select Cell</option>{cellOptions.map((cell: string) => <option key={cell} value={cell}>{cell}</option>)}</select>
+                    <select value={farmerForm.village} onChange={(e) => updateAddressSelection("village", e.target.value)} disabled={!farmerForm.cell} className="rounded-xl border px-3 py-2"><option value="">Select Village</option>{villageOptions.map((village: string) => <option key={village} value={village}>{village}</option>)}</select>
+                    <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900 sm:col-span-2">{buildFarmerAddress({ province: farmerForm.province, district: farmerForm.district, sector: farmerForm.sector, cell: farmerForm.cell, village: farmerForm.village }) || "Select a complete Rwanda address"}</div>
                   </div>
                 ) : (
                   <div className="mt-4 grid gap-3 sm:grid-cols-2">
@@ -714,7 +995,7 @@ export default function OperationsPage({ managementOnly = false }: { managementO
                 )}
                 <div className="mt-5 flex justify-end gap-2">
                   <button type="button" onClick={() => { setEditingFarmer(null); setEditingCow(null); }} className="rounded-xl border px-4 py-2 text-sm">Cancel</button>
-                  <button type="button" onClick={() => editingFarmer ? requestManageConfirmation("updateFarmer", editingFarmer, "Confirm changes", "Save your changes to this farmer record?") : editingCow ? requestManageConfirmation("updateAnimal", editingCow, "Confirm changes", "Save your changes to this cow record?") : undefined} className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white">Save changes</button>
+                  <button type="button" onClick={() => editingFarmer ? requestFarmerUpdate() : editingCow ? requestManageConfirmation("updateAnimal", editingCow, "Confirm changes", "Save your changes to this cow record?") : undefined} className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white">Save changes</button>
                 </div>
               </div>
             </div>
@@ -762,23 +1043,23 @@ export default function OperationsPage({ managementOnly = false }: { managementO
           ) : null}
 
           <div className="grid gap-6 xl:grid-cols-2 print:hidden">
-            <form id="farmer-management" className={`${!showSection("farmer-management") || !canRegisterFarmer || (managementOnly ? currentUser.role !== "VETERINARY_OFFICER" : !["MCC_OFFICER", "MILK_COLLECTOR"].includes(currentUser.role)) ? "hidden " : ""}rounded-2xl border border-slate-200 bg-white p-5 shadow-sm`} onSubmit={(event) => { event.preventDefault(); if (!isValidEmail(farmerForm.email)) { setMessage("Enter a valid farmer email address before saving."); return; } requestSubmitConfirmation("createFarmer", { farmerId: `F-${Date.now()}`, ...farmerForm, status: "ACTIVE" }, currentUser.role === "VETERINARY_OFFICER" ? "Farmer registered and assigned to the collector." : "Farmer registered to your account.", "farmer"); }}>
+            <form id="farmer-management" className={`${!showSection("farmer-management") || !canRegisterFarmer ? "hidden " : ""}rounded-2xl border border-slate-200 bg-white p-5 shadow-sm`} onSubmit={(event) => { event.preventDefault(); if (farmerForm.email && !isValidEmail(farmerForm.email)) { setMessage("Enter a valid farmer email address before saving."); return; } if (!farmerForm.phone.trim()) { setMessage("Phone Number is required."); return; } const normalizedPhone = normalizePhoneNumber(farmerForm.phone); if (!isValidRwandaPhoneNumber(normalizedPhone)) { setMessage("Enter a valid Rwanda phone number in the format 078XXXXXXX."); return; } if (!farmerForm.nationalId.trim() || !isValidNationalId(farmerForm.nationalId)) { setMessage("Enter a valid 16-digit national ID number."); return; } if (!farmerForm.province || !farmerForm.district || !farmerForm.sector || !farmerForm.cell || !farmerForm.village) { setMessage("Select a complete Rwanda address before registering the farmer."); return; } requestSubmitConfirmation("createFarmer", { farmerId: `F-${Date.now()}`, ...farmerForm, phone: normalizedPhone, nationalId: farmerForm.nationalId.trim(), status: "ACTIVE" }, currentUser.role === "VETERINARY_OFFICER" ? "Farmer registered and assigned to the collector." : "Farmer registered to your account.", "farmer"); }}>
               <h2 className="text-lg font-semibold">Register farmer</h2>
               <div className="mt-4 grid gap-3 md:grid-cols-2">
-                <input required placeholder="Full name" value={farmerForm.fullName} onChange={(e) => setFarmerForm({ ...farmerForm, fullName: e.target.value })} className="rounded-xl border px-3 py-2" />
-                <input required placeholder="Username" value={farmerForm.username} onChange={(e) => setFarmerForm({ ...farmerForm, username: e.target.value })} className="rounded-xl border px-3 py-2" />
-                <label className="flex max-w-md flex-col gap-1.5 md:col-span-2"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Email address</span><input required type="email" inputMode="email" autoComplete="email" placeholder="farmer@example.com" value={farmerForm.email} onChange={(e) => setFarmerForm({ ...farmerForm, email: e.target.value })} onBlur={() => { if (farmerForm.email && !isValidEmail(farmerForm.email)) setMessage("Enter a valid farmer email address."); }} aria-invalid={Boolean(farmerForm.email && !isValidEmail(farmerForm.email))} className={`w-full rounded-xl border px-3 py-2.5 outline-none transition focus:ring-2 focus:ring-emerald-200 ${farmerForm.email && !isValidEmail(farmerForm.email) ? "border-rose-400 bg-rose-50" : "border-slate-200 bg-slate-50 focus:border-emerald-500"}`} />{farmerForm.email && !isValidEmail(farmerForm.email) ? <span className="text-xs text-rose-600">Use a valid format such as farmer@example.com.</span> : null}</label>
-                <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">The farmer signs in first with the system default password and must change it before access is granted.</p>
-                <input required placeholder="Phone" value={farmerForm.phone} onChange={(e) => setFarmerForm({ ...farmerForm, phone: e.target.value })} className="rounded-xl border px-3 py-2" />
-                <input required placeholder="National ID" value={farmerForm.nationalId} onChange={(e) => setFarmerForm({ ...farmerForm, nationalId: e.target.value })} className="rounded-xl border px-3 py-2" />
-                <input required placeholder="District" value={farmerForm.district} onChange={(e) => setFarmerForm({ ...farmerForm, district: e.target.value })} className="rounded-xl border px-3 py-2" />
-                <input required placeholder="Sector" value={farmerForm.sector} onChange={(e) => setFarmerForm({ ...farmerForm, sector: e.target.value })} className="rounded-xl border px-3 py-2" />
-                <input required placeholder="Cell" value={farmerForm.cell} onChange={(e) => setFarmerForm({ ...farmerForm, cell: e.target.value })} className="rounded-xl border px-3 py-2" />
-                <input required placeholder="Village" value={farmerForm.village} onChange={(e) => setFarmerForm({ ...farmerForm, village: e.target.value })} className="rounded-xl border px-3 py-2" />
+                <label className="flex flex-col gap-1.5"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Farmer Name / Full Name <span className="text-rose-500">*</span></span><input required placeholder="Full name" value={farmerForm.fullName} onChange={(e) => setFarmerForm({ ...farmerForm, fullName: e.target.value })} className="rounded-xl border px-3 py-2" /></label>
+                <label className="flex flex-col gap-1.5 md:col-span-2"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Email (Optional)</span><input type="email" inputMode="email" autoComplete="email" placeholder="farmer@example.com" value={farmerForm.email} onChange={(e) => setFarmerForm({ ...farmerForm, email: e.target.value })} onBlur={() => { if (farmerForm.email && !isValidEmail(farmerForm.email)) setMessage("Enter a valid farmer email address."); }} aria-invalid={Boolean(farmerForm.email && !isValidEmail(farmerForm.email))} className={`w-full rounded-xl border px-3 py-2.5 outline-none transition focus:ring-2 focus:ring-emerald-200 ${farmerForm.email && !isValidEmail(farmerForm.email) ? "border-rose-400 bg-rose-50" : "border-slate-200 bg-slate-50 focus:border-emerald-500"}`} />{farmerForm.email && !isValidEmail(farmerForm.email) ? <span className="text-xs text-rose-600">Use a valid format such as farmer@example.com.</span> : null}</label>
+                <label className="flex flex-col gap-1.5"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Phone Number <span className="text-rose-500">*</span></span><input required placeholder="078XXXXXXX" value={farmerForm.phone} onChange={(e) => setFarmerForm({ ...farmerForm, phone: e.target.value })} className="rounded-xl border px-3 py-2" /></label>
+                <label className="flex flex-col gap-1.5"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">ID Number <span className="text-rose-500">*</span></span><input required placeholder="119XXXXXXXXXXXX" value={farmerForm.nationalId} onChange={(e) => setFarmerForm({ ...farmerForm, nationalId: e.target.value })} className="rounded-xl border px-3 py-2" /></label>
+                <label className="flex flex-col gap-1.5"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Province <span className="text-rose-500">*</span></span><select value={farmerForm.province} onChange={(e) => updateAddressSelection("province", e.target.value)} className="rounded-xl border px-3 py-2"><option value="">Select Province</option>{provinceOptions.map((province) => <option key={province} value={province}>{province}</option>)}</select></label>
+                <label className="flex flex-col gap-1.5"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">District <span className="text-rose-500">*</span></span><select value={farmerForm.district} onChange={(e) => updateAddressSelection("district", e.target.value)} disabled={!farmerForm.province} className="rounded-xl border px-3 py-2 disabled:cursor-not-allowed disabled:bg-slate-100"><option value="">Select District</option>{districtOptions.map((district: string) => <option key={district} value={district}>{district}</option>)}</select></label>
+                <label className="flex flex-col gap-1.5"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Sector <span className="text-rose-500">*</span></span><select value={farmerForm.sector} onChange={(e) => updateAddressSelection("sector", e.target.value)} disabled={!farmerForm.district} className="rounded-xl border px-3 py-2 disabled:cursor-not-allowed disabled:bg-slate-100"><option value="">Select Sector</option>{sectorOptions.map((sector: string) => <option key={sector} value={sector}>{sector}</option>)}</select></label>
+                <label className="flex flex-col gap-1.5"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Cell <span className="text-rose-500">*</span></span><select value={farmerForm.cell} onChange={(e) => updateAddressSelection("cell", e.target.value)} disabled={!farmerForm.sector} className="rounded-xl border px-3 py-2 disabled:cursor-not-allowed disabled:bg-slate-100"><option value="">Select Cell</option>{cellOptions.map((cell: string) => <option key={cell} value={cell}>{cell}</option>)}</select></label>
+                <label className="flex flex-col gap-1.5"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Village <span className="text-rose-500">*</span></span><select value={farmerForm.village} onChange={(e) => updateAddressSelection("village", e.target.value)} disabled={!farmerForm.cell} className="rounded-xl border px-3 py-2 disabled:cursor-not-allowed disabled:bg-slate-100"><option value="">Select Village</option>{villageOptions.map((village: string) => <option key={village} value={village}>{village}</option>)}</select></label>
+                <label className="flex flex-col gap-1.5 md:col-span-2"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Generated Address</span><div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900">{generatedFarmerAddress || "Select province, district, sector, cell, and village"}</div></label>
                 <select required aria-label="MCC Name" value={farmerForm.mccId} onChange={(e) => setFarmerForm({ ...farmerForm, mccId: e.target.value })} className="rounded-xl border px-3 py-2"><option value="">Select MCC Name</option>{currentState.mccs.map((mcc) => <option key={mcc.mccId} value={mcc.mccId}>{mcc.name}</option>)}</select>
                 {currentUser.role === "VETERINARY_OFFICER" ? <select required value={farmerForm.collectorId} onChange={(e) => setFarmerForm({ ...farmerForm, collectorId: e.target.value })} className="rounded-xl border px-3 py-2"><option value="">Assign collector</option>{collectors.map((collector) => <option key={collector.uid} value={collector.uid}>{collector.fullName}</option>)}</select> : null}
               </div>
-              <button disabled={!canWrite} className="mt-4 rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50">Save farmer</button>
+              <button disabled={!canWrite} className="mt-4 rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50">Register Farmer</button>
             </form>
 
             <section id="cow-management" className={`${!showSection("cow-management") || (managementOnly ? currentUser.role !== "VETERINARY_OFFICER" : !["MCC_OFFICER", "MILK_COLLECTOR"].includes(currentUser.role)) ? "hidden " : ""}rounded-2xl border border-slate-200 bg-white p-5 shadow-sm`}>
@@ -843,7 +1124,10 @@ export default function OperationsPage({ managementOnly = false }: { managementO
                             <td className="px-3 py-2 font-medium text-slate-900">{cow.tagNumber}</td>
                             <td className="px-3 py-2">{cow.breed}</td>
                             <td className="px-3 py-2">{cow.sex === "FEMALE" ? "Female" : "Male"}</td>
-                            <td className="px-3 py-2"><button type="button" onClick={() => setCowBatchCows((current) => current.filter((item) => item.animalId !== cow.animalId))} className="text-xs font-semibold text-rose-600">Remove</button></td>
+                            <td className="px-3 py-2">
+                              <button type="button" onClick={() => startEditCowBatchCow(cow)} className="text-xs font-semibold text-slate-700 hover:underline">Edit</button>
+                              <button type="button" onClick={() => removeCowBatchCow(cow.animalId)} className="ml-3 text-xs font-semibold text-rose-600">Remove</button>
+                            </td>
                           </tr>
                         ))}
                       </tbody>
@@ -851,7 +1135,57 @@ export default function OperationsPage({ managementOnly = false }: { managementO
                   </div>
                 </div>
               ) : null}
-              {pendingCowBatch ? <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4"><p className="font-semibold text-amber-900">OTP authorization requested for {pendingCowBatch.cowCount} cows</p><p className="mt-1 text-sm text-amber-800">One OTP was sent to the farmer phone. Enter the OTP provided by the farmer to register the complete batch. It expires at {new Date(pendingCowBatch.expiresAt).toLocaleTimeString()}.</p><div className="mt-3 flex gap-2"><input inputMode="numeric" maxLength={6} placeholder="6-digit OTP" value={cowBatchOtp} onChange={(e) => setCowBatchOtp(e.target.value.replace(/\D/g, "").slice(0, 6))} className="rounded-xl border px-3 py-2" /><button type="button" disabled={cowBatchOtp.length !== 6} onClick={() => void verifyCowBatchOtp()} className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">Verify OTP &amp; Register All</button></div></div> : null}
+              {pendingCowBatch ? (
+                <div className="mt-4 rounded-xl border border-amber-300 bg-amber-50 p-4">
+                  <p className="text-base font-semibold text-amber-950">Verify Cow Registration</p>
+                  <dl className="mt-3 grid grid-cols-2 gap-2 rounded-lg bg-white p-3 text-sm">
+                    <div><dt className="text-xs uppercase tracking-wide text-slate-500">Farmer</dt><dd className="font-medium text-slate-900">{pendingCowBatch.farmerName}</dd></div>
+                    <div><dt className="text-xs uppercase tracking-wide text-slate-500">Phone</dt><dd className="font-medium text-slate-900">{maskPhoneNumber(pendingCowBatch.farmerPhone)}</dd></div>
+                    <div className="col-span-2"><dt className="text-xs uppercase tracking-wide text-slate-500">Cow tag(s) &amp; breed</dt><dd className="font-medium text-slate-900">{pendingCowBatch.cows.map((cow) => `${cow.tagNumber} (${cow.breed})`).join(", ")}</dd></div>
+                  </dl>
+                  <p className="mt-3 text-sm text-amber-800">An OTP has been sent to the farmer&apos;s registered phone number.</p>
+                  {!cowBatchOtpExpired ? (
+                    <p className="mt-1 text-xs font-semibold text-amber-900">OTP expires in: {formatCountdown(cowBatchOtpSecondsLeft)}</p>
+                  ) : (
+                    <p className="mt-1 text-xs font-semibold text-rose-700">OTP has expired. Please request a new OTP to continue.</p>
+                  )}
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <input
+                      inputMode="numeric"
+                      maxLength={6}
+                      placeholder="Enter OTP"
+                      disabled={cowBatchOtpExpired || cowBatchBusy !== "idle"}
+                      value={cowBatchOtp}
+                      onChange={(e) => setCowBatchOtp(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                      className="rounded-xl border px-3 py-2 disabled:cursor-not-allowed disabled:bg-slate-100"
+                    />
+                    <button
+                      type="button"
+                      disabled={cowBatchOtp.length !== 6 || cowBatchOtpExpired || cowBatchBusy !== "idle"}
+                      onClick={() => void verifyCowBatchOtp()}
+                      className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50"
+                    >
+                      {cowBatchBusy === "verifying" ? "Verifying OTP..." : "Verify OTP"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={cowBatchBusy !== "idle"}
+                      onClick={requestCancelCowRegistration}
+                      className="rounded-xl border-2 border-rose-600 px-4 py-2 text-sm font-semibold text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                    >
+                      {cowBatchBusy === "cancelling" ? "Cancelling OTP..." : "Cancel OTP"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={cowBatchBusy !== "idle"}
+                      onClick={() => void resendCowBatchOtp()}
+                      className="rounded-xl border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                    >
+                      {cowBatchBusy === "resending" ? "Generating OTP..." : "Resend OTP"}
+                    </button>
+                  </div>
+                </div>
+              ) : null}
             </section>
 
             <form id="milk-collection" className={`${!showSection("milk-collection") || managementOnly || !canCollect ? "hidden " : ""}rounded-2xl border border-slate-200 bg-white p-5 shadow-sm`} onSubmit={(event) => { event.preventDefault(); if (selectedFarmerCows.length && !collectionForm.animalId) { setMessage("Select an eligible cow before recording milk collection."); return; } requestSubmitConfirmation("createCollection", { collectionId: `COL-${Date.now()}`, farmerId: collectionForm.farmerId, animalId: collectionForm.animalId || undefined, mccId: selectedCollectionFarmer?.mccId ?? farmerForm.mccId, collectionDate: new Date().toISOString(), collectionSource: currentUser.role === "MILK_COLLECTOR" ? "FARMER_COLLECTION_CHAIN" : collectionForm.collectionSource, litres: Number(collectionForm.litres), fatPercentage: Number(collectionForm.fatPercentage), temperatureC: Number(collectionForm.temperatureC), acceptanceStatus: "PENDING", collectedBy: currentUser.uid }, "Milk collection recorded.", "milk collection"); }}>
@@ -1052,10 +1386,12 @@ export default function OperationsPage({ managementOnly = false }: { managementO
                           <div className="flex flex-wrap gap-2 text-sm text-slate-600">
                             <span>Owner: <strong>{farmer.fullName}</strong></span><span>National ID: <strong>{farmer.nationalId ?? "Not provided"}</strong></span><span>MCC Name: <strong>{farmer.mccName ?? farmer.mccId}</strong></span>
                           </div>
+                          <p className="mt-3 text-sm text-slate-600">Address: <strong className="text-slate-900">{farmer.fullAddress ?? "Not provided"}</strong></p>
+                          <div className="mt-2 grid gap-2 text-sm text-slate-600 sm:grid-cols-2"><span>Province: <strong>{farmer.province ?? "Not provided"}</strong></span><span>District: <strong>{farmer.district ?? "Not provided"}</strong></span><span>Sector: <strong>{farmer.sector ?? "Not provided"}</strong></span><span>Cell: <strong>{farmer.cell ?? "Not provided"}</strong></span><span>Village: <strong>{farmer.village ?? "Not provided"}</strong></span></div>
                           <div className="mt-3 flex flex-wrap gap-2 print:hidden">
                             {currentUser.role !== "MILK_COLLECTOR" ? (
                               <>
-                                <button type="button" onClick={() => setEditingFarmer(farmer)} className="rounded-lg border px-3 py-1.5 text-xs font-medium">Edit farmer</button>
+                                <button type="button" onClick={() => { setFarmerForm((current) => ({ ...current, province: farmer.province ?? "", district: farmer.district ?? "", sector: farmer.sector ?? "", cell: farmer.cell ?? "", village: farmer.village ?? "" })); setEditingFarmer(farmer); }} className="rounded-lg border px-3 py-1.5 text-xs font-medium">Edit farmer</button>
                                 <button type="button" onClick={() => requestManageConfirmation("deleteFarmer", { farmerId: farmer.farmerId }, "Confirm deletion", "Delete this farmer and all assigned cows? This action cannot be undone.", true)} className="rounded-lg bg-rose-600 px-3 py-1.5 text-xs font-medium text-white">Delete farmer</button>
                               </>
                             ) : null}
